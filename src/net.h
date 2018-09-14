@@ -1,5 +1,5 @@
 // Copyright (c) 2009-2010 Satoshi Nakamoto
-// Copyright (c) 2009-2016 The Bitcoin Core developers
+// Copyright (c) 2009-2018 The Bitcoin Core developers
 // Distributed under the MIT software license, see the accompanying
 // file COPYING or http://www.opensource.org/licenses/mit-license.php.
 
@@ -37,10 +37,6 @@
 class CScheduler;
 class CNode;
 
-namespace boost {
-    class thread_group;
-} // namespace boost
-
 /** Time between pings automatically sent out for latency probing and keepalive (in seconds). */
 static const int PING_INTERVAL = 2 * 60;
 /** Time after which to disconnect, after waiting for a ping response (or inactivity). */
@@ -49,6 +45,8 @@ static const int TIMEOUT_INTERVAL = 20 * 60;
 static const int FEELER_INTERVAL = 120;
 /** The maximum number of entries in an 'inv' protocol message */
 static const unsigned int MAX_INV_SZ = 50000;
+/** The maximum number of entries in a locator */
+static const unsigned int MAX_LOCATOR_SZ = 101;
 /** The maximum number of new addresses to accumulate before announcing. */
 static const unsigned int MAX_ADDR_TO_SEND = 1000;
 /** Maximum length of incoming protocol messages (no message over 4 MB is currently acceptable). */
@@ -158,10 +156,16 @@ public:
         m_msgproc = connOptions.m_msgproc;
         nSendBufferMaxSize = connOptions.nSendBufferMaxSize;
         nReceiveFloodSize = connOptions.nReceiveFloodSize;
-        nMaxOutboundTimeframe = connOptions.nMaxOutboundTimeframe;
-        nMaxOutboundLimit = connOptions.nMaxOutboundLimit;
+        {
+            LOCK(cs_totalBytesSent);
+            nMaxOutboundTimeframe = connOptions.nMaxOutboundTimeframe;
+            nMaxOutboundLimit = connOptions.nMaxOutboundLimit;
+        }
         vWhitelistedRange = connOptions.vWhitelistedRange;
-        vAddedNodes = connOptions.m_added_nodes;
+        {
+            LOCK(cs_vAddedNodes);
+            vAddedNodes = connOptions.m_added_nodes;
+        }
     }
 
     CConnman(uint64_t seed0, uint64_t seed1);
@@ -171,7 +175,7 @@ public:
     void Interrupt();
     bool GetNetworkActive() const { return fNetworkActive; };
     void SetNetworkActive(bool active);
-    bool OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant *grantOutbound = nullptr, const char *strDest = nullptr, bool fOneShot = false, bool fFeeler = false, bool manual_connection = false);
+    void OpenNetworkConnection(const CAddress& addrConnect, bool fCountFailure, CSemaphoreGrant *grantOutbound = nullptr, const char *strDest = nullptr, bool fOneShot = false, bool fFeeler = false, bool manual_connection = false);
     bool CheckIncomingNonce(uint64_t nonce);
 
     bool ForNode(NodeId id, std::function<bool(CNode* pnode)> func);
@@ -308,6 +312,13 @@ public:
     unsigned int GetReceiveFloodSize() const;
 
     void WakeMessageHandler();
+
+    /** Attempts to obfuscate tx time through exponentially distributed emitting.
+        Works assuming that a single interval is used.
+        Variable intervals will result in privacy decrease.
+    */
+    int64_t PoissonNextSendInbound(int64_t now, int average_interval_seconds);
+
 private:
     struct ListenSocket {
         SOCKET socket;
@@ -336,7 +347,7 @@ private:
     CNode* FindNode(const CService& addr);
 
     bool AttemptToEvictConnection();
-    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure);
+    CNode* ConnectNode(CAddress addrConnect, const char *pszDest, bool fCountFailure, bool manual_connection);
     bool IsWhitelistedRange(const CNetAddr &addr);
 
     void DeleteNode(CNode* pnode);
@@ -364,14 +375,14 @@ private:
     // Network usage totals
     CCriticalSection cs_totalBytesRecv;
     CCriticalSection cs_totalBytesSent;
-    uint64_t nTotalBytesRecv;
-    uint64_t nTotalBytesSent;
+    uint64_t nTotalBytesRecv GUARDED_BY(cs_totalBytesRecv);
+    uint64_t nTotalBytesSent GUARDED_BY(cs_totalBytesSent);
 
     // outbound limit & stats
-    uint64_t nMaxOutboundTotalBytesSentInCycle;
-    uint64_t nMaxOutboundCycleStartTime;
-    uint64_t nMaxOutboundLimit;
-    uint64_t nMaxOutboundTimeframe;
+    uint64_t nMaxOutboundTotalBytesSentInCycle GUARDED_BY(cs_totalBytesSent);
+    uint64_t nMaxOutboundCycleStartTime GUARDED_BY(cs_totalBytesSent);
+    uint64_t nMaxOutboundLimit GUARDED_BY(cs_totalBytesSent);
+    uint64_t nMaxOutboundTimeframe GUARDED_BY(cs_totalBytesSent);
 
     // Whitelisted ranges. Any node connecting from these is automatically
     // whitelisted (as well as those connecting to whitelisted binds).
@@ -389,7 +400,7 @@ private:
     CAddrMan addrman;
     std::deque<std::string> vOneShots;
     CCriticalSection cs_vOneShots;
-    std::vector<std::string> vAddedNodes;
+    std::vector<std::string> vAddedNodes GUARDED_BY(cs_vAddedNodes);
     CCriticalSection cs_vAddedNodes;
     std::vector<CNode*> vNodes;
     std::list<CNode*> vNodesDisconnected;
@@ -416,7 +427,7 @@ private:
     bool fMsgProcWake;
 
     std::condition_variable condMsgProc;
-    std::mutex mutexMsgProc;
+    Mutex mutexMsgProc;
     std::atomic<bool> flagInterruptMsgProc;
 
     CThreadInterrupt interruptNet;
@@ -432,11 +443,15 @@ private:
      *  This takes the place of a feeler connection */
     std::atomic_bool m_try_another_outbound_peer;
 
+    std::atomic<int64_t> m_next_send_inv_to_incoming{0};
+
     friend struct CConnmanTest;
 };
 extern std::unique_ptr<CConnman> g_connman;
-void Discover(boost::thread_group& threadGroup);
-void MapPort(bool fUseUPnP);
+void Discover();
+void StartMapPort();
+void InterruptMapPort();
+void StopMapPort();
 unsigned short GetListenPort();
 bool BindListenPort(const CService &bindAddr, std::string& strError, bool fWhitelisted = false);
 
@@ -462,9 +477,16 @@ class NetEventsInterface
 {
 public:
     virtual bool ProcessMessages(CNode* pnode, std::atomic<bool>& interrupt) = 0;
-    virtual bool SendMessages(CNode* pnode, std::atomic<bool>& interrupt) = 0;
+    virtual bool SendMessages(CNode* pnode) = 0;
     virtual void InitializeNode(CNode* pnode) = 0;
     virtual void FinalizeNode(NodeId id, bool& update_connection_time) = 0;
+
+protected:
+    /**
+     * Protected destructor so that instances can only be deleted by derived classes.
+     * If that restriction is no longer desired, this should be made public and virtual.
+     */
+    ~NetEventsInterface() = default;
 };
 
 enum
@@ -485,7 +507,7 @@ bool IsLimited(enum Network net);
 bool IsLimited(const CNetAddr& addr);
 bool AddLocal(const CService& addr, int nScore = LOCAL_NONE);
 bool AddLocal(const CNetAddr& addr, int nScore = LOCAL_NONE);
-bool RemoveLocal(const CService& addr);
+void RemoveLocal(const CService& addr);
 bool SeenLocal(const CService& addr);
 bool IsLocal(const CService& addr);
 bool GetLocal(CService &addr, const CNetAddr *paddrPeer = nullptr);
@@ -536,6 +558,7 @@ public:
     double dPingTime;
     double dPingWait;
     double dMinPing;
+    CAmount minFeeFilter;
     // Our address, as reported by the peer
     std::string addrLocal;
     // Address of this peer
@@ -637,6 +660,7 @@ public:
     bool fOneShot;
     bool m_manual_connection;
     bool fClient;
+    bool m_limited_node; //after BIP159
     const bool fInbound;
     std::atomic_bool fSuccessfullyConnected;
     std::atomic_bool fDisconnect;
@@ -851,6 +875,6 @@ public:
 
 
 /** Return a timestamp in the future (in microseconds) for exponentially distributed events. */
-int64_t PoissonNextSend(int64_t nNow, int average_interval_seconds);
+int64_t PoissonNextSend(int64_t now, int average_interval_seconds);
 
 #endif // BITCOIN_NET_H
